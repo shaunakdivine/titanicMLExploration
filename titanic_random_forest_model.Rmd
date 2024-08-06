@@ -1,0 +1,309 @@
+---
+title: "titanicnew3.0"
+output: html_document
+date: "2024-07-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+
+
+
+```{r a}
+library(caret)
+library(xgboost)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(tidyverse)
+library(dplyr)
+library(corrplot)
+library(rvest)
+#install.packages("vip")
+library(vip)
+
+survival_counts <- table(newtitanic$Survived)
+print(survival_counts)
+
+
+
+titanic
+
+titanic_work <- titanic_cleaned_new
+titanic_work <- titanic_work[-c(62, 830), ]
+str(titanic_work)
+titanic_work <- na.omit(titanic_work)
+#titanic_work <- titanic_work %>% select(-X)
+titanic_work$Survived = factor(titanic_work$Survived, levels = c("1", "0"),
+                               labels = c("Survived", "Not_Survived"))
+titanic_work$Pclass = factor(titanic_work$Pclass, levels = c("1", "2", "3"),
+                             labels = c("Class1", "Class2", "Class3"))
+titanic_work$Sex = factor(titanic_work$Sex)
+titanic_work$Embarked = factor(titanic_work$Embarked)
+titanic_work$Deck_Level = factor(titanic_work$Deck_Level)
+title_counts <- titanic_work %>%
+  group_by(Title) %>%
+  tally() %>%
+  rename(Title_Count = n)
+# Combine titles with fewer than 5 entries into "Rare"
+titanic_work <- titanic_work %>%
+  left_join(title_counts, by = "Title") %>%
+  mutate(Title = ifelse(Title_Count < 5, "Rare", Title)) 
+#  select(-Title_Count)  # Remove the count column if no longer needed
+titanic_work$Title = factor(titanic_work$Title)
+
+titanic <- titanic_work
+#Need to change survived to factor, sex to factor, parch to factor,
+#embarked to factor
+#Should drop passenger name, ID, Ticket Number, Cabin
+#should think about making bands for age, fare
+#should maybe encode embarked
+
+#######################
+#Random Forest
+#######################
+#operates by constructing a multitude of decision trees during training
+#and outputting the final predicted class for a given observation 
+#which is determined by the majority vote of all the individual decision trees in the forest
+
+newtitanic <- titanic 
+
+# Split the data into training and test sets
+set.seed(100)
+train_ix <- createDataPartition(newtitanic$Survived, p = 0.8, list = FALSE)
+newtitanic_train <- newtitanic[train_ix, ]
+newtitanic_test  <- newtitanic[-train_ix, ]
+
+# Note that caret used stratified sampling to preserve the balance of Yes/No
+table(newtitanic$Survived[train_ix]) %>% prop.table()
+table(newtitanic$Survived[-train_ix]) %>% prop.table()
+
+
+# Setup cross-validation
+####################################################################
+# wanting to try diff combinations of these parameters
+rf_grid <- expand.grid(mtry = c(2, 4, 6, 8, 10))
+
+
+fit_control <- trainControl(
+  method = "cv",
+  number = 10, #number of folds
+  # Save predicted probabilities, not just classifications
+  classProbs = TRUE,
+  # Save all the holdout predictions, to summarize and plot
+  savePredictions = TRUE,
+  summaryFunction = twoClassSummary, #to calc roc 
+  selectionFunction="oneSE")
+
+#random forest: 
+#operates by constructing a multitude of decision trees during training
+#and outputting the final predicted class for a given observation 
+#which is determined by the majority vote of all the individual decision trees in the forest
+
+set.seed(100)
+rf_fit <- train(Survived ~ ., data = newtitanic_train, 
+                method = "rf", 
+                trControl = fit_control,
+                tuneGrid = rf_grid,
+                ntree = 500, #lower bc higher doesn't improve model
+                metric = "ROC",
+                maxnodes = 50, 
+                nodesize = 10,
+                importance = TRUE)
+
+# Step 6: Print and plot the results
+print(rf_fit)
+plot(rf_fit)
+
+# Step 7: Evaluate the model on test data
+predictions <- predict(rf_fit, newtitanic_test)
+#confusion matrix evalutes the performance of a classification model
+conf_matrix <- confusionMatrix(predictions, newtitanic_test$Survived)
+print(conf_matrix)
+confusionMatrix(rf_fit)
+
+thresholder(rf_fit, 
+            threshold = 0.5, #keeping at .5
+            final = TRUE,
+            statistics = c("Sensitivity",
+                           "Specificity"))
+
+rf_fit_res = thresholder(rf_fit, 
+                         threshold = seq(0, 1, by = 0.01), 
+                         final = TRUE) #only shows final fit curve
+
+plot(J~prob_threshold, data=rf_fit_res, type='l')
+
+optim_J = rf_fit_res[which.max(rf_fit_res$J),]
+
+cm_table <- as.data.frame(conf_matrix$table)
+ggplot(data = cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix", x = "Actual", y = "Predicted")
+
+#roc curve: recieving operating characteristic: used to evaluate the performance of a binary classification model.
+#plots the true positive rate against the false positive rate
+
+ggplot(aes(x=1-Specificity, y=Sensitivity), data=rf_fit_res) + 
+  geom_line() + 
+  ylab("TPR (Sensitivity)") + 
+  xlab("FPR (1-Specificity)") + 
+  ggtitle("ROC") +
+  geom_abline(intercept=0, slope=1, linetype='dotted') +
+  geom_segment(aes(x=1-Specificity, xend=1-Specificity, y=1-Specificity, yend=Sensitivity), color='darkred', data=optim_J) + 
+  theme_bw()
+
+
+
+
+#pr curve: precision recall curve: used to evaluate the performance of a binary classification model:
+#particularly in cases where the classes are impbalanced
+# it plots precision (positive predictive value) against recall (sensitivity)
+
+#classes are fairly balanced so no point for this.
+
+#lift curve: performance evauation in binary classification.
+#provides how much a predictive model performs rather than a random guess
+
+best_pars = rf_fit$bestTune #best parameters from the random forest model
+#filter the predictions using the best parameters
+best_preds = rf_fit$pred %>% filter(mtry == best_pars$mtry)
+#create lift chart data
+rf_lift = caret::lift(pred~Survived, data=best_preds)
+
+ggplot(rf_lift) + 
+  geom_abline(slope=1, linetype='dotted') +
+  theme_bw()
+
+
+#calibration plot: used to assess the calibration of a probabilitic binary classification model
+# a good calibration plot will have predicted probabilities that closely match the actual probabilities of the positive class
+
+
+survival_counts <- table(newtitanic$Survived)
+print(survival_counts)
+
+#### Holdout set results
+
+test_probs = predict(rf_fit, newdata=newtitanic_test, type="prob")
+
+get_metrics = function(threshold, test_probs, true_class, 
+                       pos_label, neg_label) {
+  # Get class predictions
+  pc = factor(ifelse(test_probs[pos_label]>threshold, pos_label, neg_label), levels=c(pos_label, neg_label))
+  test_set = data.frame(obs = true_class, pred = pc, test_probs)
+  my_summary(test_set, lev=c(pos_label, neg_label))
+}
+
+# Get metrics for a given threshold
+get_metrics(0.75, test_probs, newtitanic_test$Survived, "Survived", "Not_Survived")
+
+# Compute metrics on test data using a grid of thresholds
+thr_seq = seq(0, 1, length.out=500)
+metrics = lapply(thr_seq, function(x) get_metrics(x, test_probs, newtitanic_test$Survived, "Survived", "Not_Survived"))
+metrics_df = data.frame(do.call(rbind, metrics))
+
+# ROC curve
+
+ggplot(aes(x=FPR, y=TPR), data=metrics_df) + 
+  geom_line() +
+  ylab("TPR (Sensitivity)") + 
+  xlab("FPR (1-Specificity)") + 
+  geom_abline(intercept=0, slope=1, linetype='dotted') +
+  annotate("text", x=0.75, y=0.25, 
+           label=paste("AUC:",round(metrics_df$AUC_ROC[1], 2))) +
+  theme_bw()
+
+# Lift
+
+rf_oos_lift = caret::lift(newtitanic_test$Survived~test_probs[,1])
+
+ggplot(rf_oos_lift) + 
+  geom_abline(slope=1, linetype='dotted') +
+  xlim(c(0, 100)) + 
+  theme_bw()
+
+
+
+#stop()
+
+# Extract out-of-sample predicted probs for the optimal model
+# best_pars = gbmfit$bestTune
+# best_preds = gbmfit$pred %>% filter(n.trees==best_pars$n.trees, 
+#                                       interaction.depth==best_pars$interaction.depth)
+
+# We can extract more information using the MLeval package
+rf_perf = evalm(rf_fit, showplots=FALSE)
+
+# The return object contains ggplot objects you can customize
+rf_perf$roc + 
+  ggtitle("ROC curve for RF") +
+  theme_bw() 
+
+
+
+#rf_perf$cc + 
+ # ggtitle("Calibration curve for RF")
+
+
+#num of trees, mtry, minimun node size
+
+# Extract importance
+rf_model <- rf_fit$finalModel
+importance <- randomForest::importance(rf_model)
+importance_df <- data.frame(Feature = rownames(importance), Importance = importance[,1])
+
+# Print importance
+print(importance_df)
+
+# Plot feature importance using ggplot2
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  xlab("Feature") +
+  ylab("Importance") +
+  ggtitle("Feature Importance for Random Forest Model") +
+  theme_minimal()
+
+# Plot feature importance using vip
+vip(rf_fit$finalModel, num_features = 10) +
+  ggtitle("Feature Importance for Random Forest Model") +
+  theme_minimal()
+
+
+```
+
+
+Roc: red line to black line is best. want to max aoc under curve. auc: .88
+lift: for converving recources, best at around 30% samples tested
+conversion : 
+put roc with auc into presentation
+
+threshold: By default, the threshold is set at 0.5. This means that if the predicted probability for class "A" is greater than or equal to 0.5, the observation is classified as "A". Otherwise, it is classified as "B".
+
+
